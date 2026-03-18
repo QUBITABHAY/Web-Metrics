@@ -3,7 +3,7 @@
   "title": "Web Metrics",
   "description": "Fetch and display website performance metrics using Google PageSpeed Insights API",
   "icon": "icon.png",
-  "author": "abhay",
+  "author": "qubitabhay",
   "categories": [
     "Developer Tools",
     "Web"

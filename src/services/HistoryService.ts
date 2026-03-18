@@ -1,57 +1,61 @@
 /**
  * HistoryService.ts
  *
- * Single responsibility: persist and retrieve the list of
- * recently tested URLs using Raycast's LocalStorage API.
- *
- * URLs are stored as a JSON-serialised string[] under a
- * single storage key. The list is capped at MAX_HISTORY
- * entries (most-recent first, duplicates removed).
+ * Persists recently-tested URLs together with the strategy used
+ * and a timestamp. Storage key bumped to "url_history_v2" to avoid
+ * deserialisation conflicts with the old plain string[] format.
  */
 
 import { LocalStorage } from "@raycast/api";
+import type { Strategy } from "../types";
+
+export interface HistoryEntry {
+  url: string;
+  strategy: Strategy;
+  /** Unix timestamp (ms) when this analysis ran. */
+  timestamp: number;
+}
 
 export class HistoryService {
-  /** Maximum number of URLs to keep in history. */
-  private readonly MAX_HISTORY = 5;
-
-  /** LocalStorage key for the history array. */
-  private readonly STORAGE_KEY = "url_history";
+  private readonly MAX_HISTORY = 10;
+  private readonly STORAGE_KEY = "url_history_v2";
 
   // ── Public API ──────────────────────────────────────────────────
 
   /**
-   * Saves a URL to history.
-   * - Deduplicates: if the URL already exists it is moved to the top.
-   * - Trims: keeps only the most recent MAX_HISTORY entries.
+   * Saves url + strategy. Deduplicates by URL (moves to top) and
+   * trims the list to MAX_HISTORY entries.
    */
-  async save(url: string): Promise<void> {
+  async save(url: string, strategy: Strategy): Promise<void> {
     const history = await this.getAll();
-
-    // Remove duplicate if it already exists
-    const filtered = history.filter((item) => item !== url);
-
-    // Prepend the new URL and cap the length
-    const updated = [url, ...filtered].slice(0, this.MAX_HISTORY);
-
+    const filtered = history.filter((e) => e.url !== url);
+    const updated: HistoryEntry[] = [
+      { url, strategy, timestamp: Date.now() },
+      ...filtered,
+    ].slice(0, this.MAX_HISTORY);
     await LocalStorage.setItem(this.STORAGE_KEY, JSON.stringify(updated));
   }
 
-  /** Returns the full history array (most-recent first). */
-  async getAll(): Promise<string[]> {
+  /** Returns all entries, most-recent first. */
+  async getAll(): Promise<HistoryEntry[]> {
     const raw = await LocalStorage.getItem<string>(this.STORAGE_KEY);
     if (!raw) return [];
-
     try {
       const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? (parsed as string[]) : [];
+      return Array.isArray(parsed) ? (parsed as HistoryEntry[]) : [];
     } catch {
-      // Corrupted storage — start fresh
       return [];
     }
   }
 
-  /** Wipes all stored history. */
+  /** Removes a single entry by URL. No-op if not present. */
+  async remove(url: string): Promise<void> {
+    const history = await this.getAll();
+    const updated = history.filter((e) => e.url !== url);
+    await LocalStorage.setItem(this.STORAGE_KEY, JSON.stringify(updated));
+  }
+
+  /** Wipes the entire history. */
   async clear(): Promise<void> {
     await LocalStorage.removeItem(this.STORAGE_KEY);
   }

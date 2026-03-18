@@ -2,42 +2,66 @@
  * Metrics.ts
  *
  * Data models for PageSpeed Insights API responses.
- * Separates the raw API shape (MetricsData) from the
- * domain object (Metrics) that provides formatted getters.
+ * Separates the raw API shape (MetricsData) from the domain
+ * object (Metrics) that exposes convenient typed getters.
+ *
+ * ReportSnapshot is a lightweight snapshot of scores + vitals
+ * persisted by ReportService for trend-delta computation.
  */
+
+import type { Strategy } from "../types";
 
 // ── Sub-interfaces ──────────────────────────────────────────────────
 
 /** A single Lighthouse opportunity or diagnostic audit. */
 export interface AuditItem {
-  /** Human-readable title (e.g. "Reduce unused JavaScript") */
   title: string;
-  /** Display value from Lighthouse (e.g. "1.2 s", "450 KiB") */
   displayValue: string;
-  /** Score 0-1 or null if informational */
   score: number | null;
 }
 
 /** A row from the resource-summary audit (scripts, images, etc.) */
 export interface ResourceBreakdownItem {
-  /** Resource type label (e.g. "Script", "Image", "Stylesheet") */
   resourceType: string;
-  /** Number of requests for this type */
   requestCount: number;
-  /** Transfer size in bytes */
   transferSize: number;
 }
 
+// ── Snapshot for trend tracking ─────────────────────────────────────
+
+export interface ReportSnapshot {
+  url: string;
+  strategy: Strategy;
+  /** Unix timestamp (ms) when this run completed. */
+  timestamp: number;
+  scores: {
+    performance: number;
+    accessibility: number;
+    bestPractices: number;
+    seo: number;
+  };
+  vitals: {
+    fcpMs: number;
+    lcpMs: number;
+    clsValue: number;
+    ttfbMs: number;
+    ttiMs: number;
+    tbtMs: number;
+    speedIndexMs: number;
+    inpMs: number;
+  };
+}
+
 // ── Raw API response shape ──────────────────────────────────────────
-/** Describes the full subset of a PageSpeed API response we use. */
+
 export interface MetricsData {
-  // ── Lighthouse category scores (0 – 1) ────────────────────────
+  // Category scores (0 – 1 from API)
   performanceScore: number;
   accessibilityScore: number;
   bestPracticesScore: number;
   seoScore: number;
 
-  // ── Core Web Vitals (milliseconds / unitless) ─────────────────
+  // Core Web Vitals (ms / unitless)
   fcpMs: number;
   lcpMs: number;
   clsValue: number;
@@ -45,28 +69,24 @@ export interface MetricsData {
   ttiMs: number;
   speedIndexMs: number;
 
-  // ── Additional performance metrics ────────────────────────────
+  // Additional performance metrics
   tbtMs: number;
   inpMs: number;
   domSize: number;
   renderBlockingCount: number;
 
-  // ── Page weight ───────────────────────────────────────────────
+  // Page weight
   totalRequests: number;
   totalSizeBytes: number;
 
-  // ── Audits ────────────────────────────────────────────────────
+  // Audits
   opportunities: AuditItem[];
   diagnostics: AuditItem[];
   resourceBreakdown: ResourceBreakdownItem[];
 }
 
-// ── Domain model with convenient getters ────────────────────────────
-/**
- * Wraps raw MetricsData and exposes human-friendly values.
- * All heavy formatting is deferred to the Formatter utility so
- * this class stays focused on data access.
- */
+// ── Domain model ────────────────────────────────────────────────────
+
 export class Metrics {
   private readonly data: MetricsData;
 
@@ -74,7 +94,7 @@ export class Metrics {
     this.data = data;
   }
 
-  // ── Category scores (scaled to 0-100) ───────────────────────────
+  // Category scores scaled to 0-100
   get performanceScore(): number {
     return Math.round(this.data.performanceScore * 100);
   }
@@ -88,7 +108,7 @@ export class Metrics {
     return Math.round(this.data.seoScore * 100);
   }
 
-  // ── Core Web Vitals (raw ms / unitless values) ──────────────────
+  // Core Web Vitals (raw values)
   get fcp(): number {
     return this.data.fcpMs;
   }
@@ -107,22 +127,20 @@ export class Metrics {
   get speedIndex(): number {
     return this.data.speedIndexMs;
   }
-
-  // ── Additional performance metrics ──────────────────────────────
   get tbt(): number {
     return this.data.tbtMs;
   }
   get inp(): number {
     return this.data.inpMs;
   }
+
+  // Page metadata
   get domSize(): number {
     return this.data.domSize;
   }
   get renderBlockingCount(): number {
     return this.data.renderBlockingCount;
   }
-
-  // ── Page weight ─────────────────────────────────────────────────
   get totalRequests(): number {
     return this.data.totalRequests;
   }
@@ -130,7 +148,7 @@ export class Metrics {
     return this.data.totalSizeBytes;
   }
 
-  // ── Audits ──────────────────────────────────────────────────────
+  // Audits
   get opportunities(): AuditItem[] {
     return this.data.opportunities;
   }
@@ -139,5 +157,30 @@ export class Metrics {
   }
   get resourceBreakdown(): ResourceBreakdownItem[] {
     return this.data.resourceBreakdown;
+  }
+
+  /** Converts this instance into a lightweight snapshot for persistence. */
+  toSnapshot(url: string, strategy: Strategy): ReportSnapshot {
+    return {
+      url,
+      strategy,
+      timestamp: Date.now(),
+      scores: {
+        performance: this.performanceScore,
+        accessibility: this.accessibilityScore,
+        bestPractices: this.bestPracticesScore,
+        seo: this.seoScore,
+      },
+      vitals: {
+        fcpMs: this.data.fcpMs,
+        lcpMs: this.data.lcpMs,
+        clsValue: this.data.clsValue,
+        ttfbMs: this.data.ttfbMs,
+        ttiMs: this.data.ttiMs,
+        tbtMs: this.data.tbtMs,
+        speedIndexMs: this.data.speedIndexMs,
+        inpMs: this.data.inpMs,
+      },
+    };
   }
 }

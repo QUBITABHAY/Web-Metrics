@@ -1,11 +1,15 @@
 /**
  * PageSpeedService.ts
  *
- * Single responsibility: communicate with the Google PageSpeed
- * Insights API v5 and return a domain Metrics object.
+ * Communicates with the Google PageSpeed Insights API v5.
  *
- * The API key is injected via the constructor so this class
- * is easily testable and never reads preferences itself.
+ * Changes vs v1:
+ *  - Fully typed Lighthouse response (no `any` casts)
+ *  - AbortController timeout (30 s) so the spinner never hangs
+ *  - Automatic single retry on transient network / 5xx failures
+ *  - Fixed INP audit id: "interaction-to-next-paint"
+ *  - MAX_AUDITS constant replaces every magic-number 5
+ *  - Strategy imported from shared types.ts and re-exported
  */
 
 import {
@@ -14,13 +18,63 @@ import {
   type AuditItem,
   type ResourceBreakdownItem,
 } from "../models/Metrics";
+import type { Strategy } from "../types";
 
-/** Allowed analysis strategies. */
-export type Strategy = "mobile" | "desktop";
+// Re-export so existing callers keep working without import changes.
+export type { Strategy };
+
+// ── Typed Lighthouse API shapes ───────────────────────────────────
+
+interface LighthouseAudit {
+  title: string;
+  description?: string;
+  score: number | null;
+  numericValue?: number;
+  displayValue?: string;
+  details?: { type: string; items?: Record<string, unknown>[] };
+}
+
+interface LighthouseAuditRef {
+  id: string;
+  weight?: number;
+  group?: string;
+}
+
+interface LighthouseCategory {
+  id: string;
+  title: string;
+  score: number | null;
+  auditRefs: LighthouseAuditRef[];
+}
+
+interface LighthouseResult {
+  audits: Record<string, LighthouseAudit>;
+  categories: {
+    performance?: LighthouseCategory;
+    accessibility?: LighthouseCategory;
+    "best-practices"?: LighthouseCategory;
+    seo?: LighthouseCategory;
+  };
+}
+
+interface PageSpeedApiResponse {
+  lighthouseResult: LighthouseResult;
+}
+
+// ── Service ───────────────────────────────────────────────────────
 
 export class PageSpeedService {
   private static readonly BASE_URL =
     "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
+
+  /** Max opportunities / diagnostics surfaced per section. */
+  private static readonly MAX_AUDITS = 5;
+
+  /** Per-request fetch timeout in milliseconds. */
+  private static readonly TIMEOUT_MS = 30_000;
+
+  /** Delay before the single automatic retry (ms). */
+  private static readonly RETRY_DELAY_MS = 1_000;
 
   private readonly apiKey: string;
 
@@ -28,64 +82,84 @@ export class PageSpeedService {
     this.apiKey = apiKey;
   }
 
-  // ── Public API ──────────────────────────────────────────────────
+  // ── Public API ────────────────────────────────────────────────
 
-  /**
-   * Fetches metrics for the given URL.
-   * Throws a user-friendly error on network or API failures.
-   */
   async fetchMetrics(url: string, strategy: Strategy): Promise<Metrics> {
-    const endpoint = this.buildEndpoint(url, strategy);
-
-    const response = await fetch(endpoint);
-
-    // Handle HTTP errors from the API
-    if (!response.ok) {
-      const body = (await response.json().catch(() => null)) as {
-        error?: { message?: string };
-      } | null;
-      const detail = body?.error?.message ?? response.statusText;
-      throw new Error(`PageSpeed API error (${response.status}): ${detail}`);
-    }
-
-    const data: unknown = await response.json();
-    return this.parseResponse(data);
+    return this.withRetry(() => this.doFetch(url, strategy));
   }
 
-  // ── Private helpers ─────────────────────────────────────────────
+  // ── Private helpers ───────────────────────────────────────────
 
-  /** Builds the full API endpoint URL with query parameters. */
+  /** Single fetch attempt with AbortController timeout. */
+  private async doFetch(url: string, strategy: Strategy): Promise<Metrics> {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      PageSpeedService.TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(this.buildEndpoint(url, strategy), {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as {
+          error?: { message?: string };
+        } | null;
+        const detail = body?.error?.message ?? response.statusText;
+        throw new Error(`PageSpeed API error (${response.status}): ${detail}`);
+      }
+      const data = (await response.json()) as PageSpeedApiResponse;
+      return this.parseResponse(data);
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        throw new Error(
+          "Request timed out after 30 s — check your connection and try again.",
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Retries fn once on transient failures (network errors or 5xx).
+   * Validation / 4xx errors and timeouts are NOT retried.
+   */
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      const name = (err as Error).name ?? "";
+      const isTransient =
+        (name === "TypeError" && msg.toLowerCase().includes("fetch")) ||
+        /\b(500|502|503|504)\b/.test(msg);
+      if (isTransient) {
+        await new Promise((r) =>
+          setTimeout(r, PageSpeedService.RETRY_DELAY_MS),
+        );
+        return fn();
+      }
+      throw err;
+    }
+  }
+
   private buildEndpoint(url: string, strategy: Strategy): string {
-    const params = new URLSearchParams({
-      url,
-      key: this.apiKey,
-      strategy,
-    });
-
-    // Request all four Lighthouse categories
-    const categories = [
+    const params = new URLSearchParams({ url, key: this.apiKey, strategy });
+    for (const cat of [
       "performance",
       "accessibility",
       "best-practices",
       "seo",
-    ];
-    for (const cat of categories) {
+    ]) {
       params.append("category", cat);
     }
-
     return `${PageSpeedService.BASE_URL}?${params.toString()}`;
   }
 
-  /**
-   * Parses the raw JSON response into our MetricsData shape.
-   * Defensively accesses nested fields — the PageSpeed response
-   * is deeply nested and values may occasionally be missing.
-   */
-  private parseResponse(data: unknown): Metrics {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json = data as any;
-
-    const lighthouse = json?.lighthouseResult;
+  private parseResponse(data: PageSpeedApiResponse): Metrics {
+    const lighthouse = data.lighthouseResult;
     if (!lighthouse) {
       throw new Error("Unexpected API response: missing lighthouseResult");
     }
@@ -93,21 +167,17 @@ export class PageSpeedService {
     const audits = lighthouse.audits ?? {};
     const categories = lighthouse.categories ?? {};
 
-    // Helper to safely read a numeric audit value
     const numericAudit = (id: string): number => audits[id]?.numericValue ?? 0;
 
-    // ── Resource summary ────────────────────────────────────────
-    const resourceItems: Array<{
-      resourceType?: string;
+    // Resource summary
+    const resourceItems = (audits["resource-summary"]?.details?.items ??
+      []) as Array<{
       label?: string;
+      resourceType?: string;
       requestCount?: number;
       transferSize?: number;
-    }> = audits["resource-summary"]?.details?.items ?? [];
-
-    // First item is the "Total" row
+    }>;
     const totalRow = resourceItems[0] ?? {};
-
-    // Remaining rows are per-type breakdowns (skip "Total")
     const resourceBreakdown: ResourceBreakdownItem[] = resourceItems
       .slice(1)
       .filter((item) => (item.requestCount ?? 0) > 0)
@@ -117,82 +187,49 @@ export class PageSpeedService {
         transferSize: item.transferSize ?? 0,
       }));
 
-    // ── Opportunities (top 5 failing audits with savings) ───────
-    const opportunities = this.extractAudits(
-      lighthouse,
-      "opportunity",
-      audits,
-      5,
-    );
-
-    // ── Diagnostics (top 5 informational audits) ────────────────
-    const diagnostics = this.extractAudits(lighthouse, "diagnostic", audits, 5);
-
-    // ── Render-blocking resources ───────────────────────────────
-    const renderBlockingItems: unknown[] =
-      audits["render-blocking-resources"]?.details?.items ?? [];
-
-    // ── DOM size ────────────────────────────────────────────────
-    const domSize: number = numericAudit("dom-size");
+    const renderBlockingItems = (audits["render-blocking-resources"]?.details
+      ?.items ?? []) as unknown[];
 
     const metricsData: MetricsData = {
-      // Category scores
       performanceScore: categories.performance?.score ?? 0,
       accessibilityScore: categories.accessibility?.score ?? 0,
       bestPracticesScore: categories["best-practices"]?.score ?? 0,
       seoScore: categories.seo?.score ?? 0,
 
-      // Core Web Vitals
       fcpMs: numericAudit("first-contentful-paint"),
       lcpMs: numericAudit("largest-contentful-paint"),
       clsValue: numericAudit("cumulative-layout-shift"),
       ttfbMs: numericAudit("server-response-time"),
       ttiMs: numericAudit("interactive"),
       speedIndexMs: numericAudit("speed-index"),
-
-      // Additional metrics
       tbtMs: numericAudit("total-blocking-time"),
-      inpMs: numericAudit("experimental-interaction-to-next-paint"),
-      domSize,
+      // Fixed: was "experimental-interaction-to-next-paint" (old Lighthouse id)
+      inpMs: numericAudit("interaction-to-next-paint"),
+      domSize: numericAudit("dom-size"),
       renderBlockingCount: renderBlockingItems.length,
 
-      // Page weight
       totalRequests: totalRow.requestCount ?? 0,
       totalSizeBytes: totalRow.transferSize ?? 0,
 
-      // Audits
-      opportunities,
-      diagnostics,
+      opportunities: this.extractAudits(lighthouse, "opportunity", audits),
+      diagnostics: this.extractAudits(lighthouse, "diagnostic", audits),
       resourceBreakdown,
     };
 
     return new Metrics(metricsData);
   }
 
-  /**
-   * Extracts audit items of a given group (opportunity | diagnostic)
-   * from the Lighthouse performance category, sorted by score (worst first),
-   * limited to `limit` items.
-   */
   private extractAudits(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    lighthouse: any,
+    lighthouse: LighthouseResult,
     group: string,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    audits: Record<string, any>,
-    limit: number,
+    audits: Record<string, LighthouseAudit>,
   ): AuditItem[] {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const auditRefs: Array<{ id: string; group?: string }> =
-      lighthouse.categories?.performance?.auditRefs ?? [];
-
+    const auditRefs = lighthouse.categories?.performance?.auditRefs ?? [];
     return auditRefs
       .filter((ref) => ref.group === group)
       .map((ref) => {
         const audit = audits[ref.id];
-        if (!audit) return null;
-        // Skip audits that "pass" (score === 1) — they aren't actionable
-        if (audit.score === 1) return null;
+        if (!audit || audit.score === 1) return null;
         return {
           title: audit.title ?? ref.id,
           displayValue: audit.displayValue ?? "",
@@ -201,6 +238,6 @@ export class PageSpeedService {
       })
       .filter((item): item is AuditItem => item !== null)
       .sort((a, b) => (a.score ?? 0) - (b.score ?? 0))
-      .slice(0, limit);
+      .slice(0, PageSpeedService.MAX_AUDITS);
   }
 }
